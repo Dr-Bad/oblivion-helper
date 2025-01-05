@@ -49,9 +49,14 @@ jobs:
         with:
           go-version: '1.23.2'
 
-      - name: Install dependencies
+      - name: Initialize Go module
         run: |
           go mod init oblivion-helper
+          go mod tidy
+
+      - name: Add dependencies
+        run: |
+          go get github.com/sagernet/sing-box@v1.10.6
           go mod tidy
 
       - name: Create gRPC directory
