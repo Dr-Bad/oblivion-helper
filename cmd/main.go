@@ -24,9 +24,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -52,6 +54,7 @@ const (
 	statusChannelCap        = 100                 // Capacity of the status channel
 	gracefulShutdownTimeout = 2 * time.Second     // Timeout for graceful shutdown
 	rulesetFolderName       = "ruleset"           // Name of the folder to store rulesets
+	macDnsServer            = "172.19.0.2"        // DNS server to use on macOS for tun mode
 )
 
 // Global variable for version
@@ -75,18 +78,33 @@ func NewLogger() *Logger {
 // Server is the main gRPC server implementation
 type Server struct {
 	pb.UnimplementedOblivionServiceServer
-	mu           sync.RWMutex // Synchronizes access to server state
-	statusChange chan string  // Channel to broadcast status updates
-	dirPath      string       // Directory path of the executable
-	instance     *box.Box     // Sing-box instance
-	logger       *Logger      // Logger for server messages
-	exportConfig ExportConfig // Export config
+	mu           sync.RWMutex   // Synchronizes access to server state
+	statusChange chan string    // Channel to broadcast status updates
+	dirPath      string         // Directory path of the executable
+	instance     *box.Box       // Sing-box instance
+	logger       *Logger        // Logger for server messages
+	exportConfig ExportConfig   // Export config
+	macDNS       *MacDNSManager // Manages macOS DNS settings
 }
 
 // ExportConfig holds the structure for the export config file
 type ExportConfig struct {
-	Interval int               `json:"interval"`
-	URLs     map[string]string `json:"urls"`
+	Interval int               `json:"interval"` // Interval in days for ruleset update checks
+	URLs     map[string]string `json:"urls"`     // URLs for downloading rulesets
+}
+
+// MacDNSManager manages DNS settings on macOS
+type MacDNSManager struct {
+	originalDNS map[string][]string // Stores original DNS settings for each network service
+	logger      *Logger             // Logger for MacDNSManager
+}
+
+// NewMacDNSManager creates a new MacDNSManager
+func NewMacDNSManager(logger *Logger) *MacDNSManager {
+	return &MacDNSManager{
+		originalDNS: make(map[string][]string),
+		logger:      logger,
+	}
 }
 
 // NewServer creates and initializes a new Server instance
@@ -96,10 +114,13 @@ func NewServer(logger *Logger) (*Server, error) {
 		return nil, fmt.Errorf("failed to get executable directory: %w", err)
 	}
 
+	macDNSManager := NewMacDNSManager(logger)
+
 	return &Server{
 		statusChange: make(chan string, statusChannelCap),
 		dirPath:      execDir,
 		logger:       logger,
+		macDNS:       macDNSManager,
 	}, nil
 }
 
@@ -172,8 +193,51 @@ func (s *Server) loadExportConfig() error {
 	return nil
 }
 
+// needsDownload checks if any ruleset needs to be downloaded based on the export config
+func (s *Server) needsDownload() bool {
+	if err := s.loadExportConfig(); err != nil {
+		s.logger.error.Printf("Error loading export config: %v", err)
+		return false
+	}
+
+	if len(s.exportConfig.URLs) == 0 {
+		return false // No URLs to download, so no download needed
+	}
+
+	rulesetPath := filepath.Join(s.dirPath, rulesetFolderName)
+
+	for filename := range s.exportConfig.URLs {
+		filePath := filepath.Join(rulesetPath, filename)
+
+		fileInfo, err := os.Stat(filePath)
+		if os.IsNotExist(err) {
+			return true // File does not exist, needs download
+		} else if err != nil {
+			s.logger.error.Printf("Error checking file %s: %v", filename, err)
+			continue // Error checking file, skip to next
+		}
+
+		if s.exportConfig.Interval <= 0 {
+			continue // Invalid interval, skip to next file
+		}
+
+		if time.Since(fileInfo.ModTime()) > time.Duration(s.exportConfig.Interval)*24*time.Hour {
+			return true // File is older than the interval, needs download
+		}
+	}
+
+	return false // All files are up to date
+}
+
 // downloadRulesets manages the downloading of rulesets based on the export config
 func (s *Server) downloadRulesets() error {
+	// Check if any download is needed before proceeding
+	if !s.needsDownload() {
+		return nil // No download needed
+	}
+
+	s.broadcastStatus("preparing")
+
 	if err := s.loadExportConfig(); err != nil {
 		return fmt.Errorf("error loading export config: %w", err)
 	}
@@ -190,8 +254,6 @@ func (s *Server) downloadRulesets() error {
 		}
 		s.logger.info.Printf("Created ruleset directory: %s", rulesetPath)
 	}
-
-	s.broadcastStatus("preparing")
 
 	for filename, url := range s.exportConfig.URLs {
 		filePath := filepath.Join(rulesetPath, filename)
@@ -253,6 +315,110 @@ func (s *Server) downloadFile(url, filePath string) error {
 	return nil
 }
 
+// getMacNetworkServices lists all network services using `networksetup -listallnetworkservices` in macOS
+func (m *MacDNSManager) getMacNetworkServices() ([]string, error) {
+	cmd := exec.Command("networksetup", "-listallnetworkservices")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list network services: %w", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	var services []string
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			services = append(services, line)
+		}
+	}
+	return services, nil
+}
+
+// getDNSForService gets the DNS servers for a given service
+func (m *MacDNSManager) getDNSForService(service string) ([]string, error) {
+	cmd := exec.Command("networksetup", "-getdnsservers", service)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dns servers for service %s: %w", service, err)
+	}
+
+	var dns []string
+	lines := strings.Split(string(output), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "There aren't any DNS Servers set") {
+			return []string{"empty"}, nil
+		}
+		if line != "" {
+			dns = append(dns, line)
+		}
+	}
+	return dns, nil
+}
+
+// setDNSForService sets the DNS servers for a given service
+func (m *MacDNSManager) setDNSForService(service string, dns []string) error {
+	args := append([]string{"-setdnsservers", service}, dns...)
+	cmd := exec.Command("networksetup", args...)
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to set dns for service %s: %w", service, err)
+	}
+	return nil
+}
+
+// applyCustomDNS applies the custom DNS settings (macDnsServer) to all network services on macOS
+func (m *MacDNSManager) applyCustomDNS() error {
+	services, err := m.getMacNetworkServices()
+	if err != nil {
+		return fmt.Errorf("error fetching network services: %w", err)
+	}
+
+	for _, service := range services {
+		dns, err := m.getDNSForService(service)
+		if err != nil {
+			m.logger.warn.Printf("Error getting DNS for service %s: %v\n", service, err)
+			continue
+		}
+		m.originalDNS[service] = dns
+
+		// Explanation:
+		// On macOS, when using a TUN interface (like sing-box's tun mode), DNS queries might leak
+		// to the system's default DNS servers instead of being routed through the VPN/proxy.
+		// To prevent these DNS leaks, we forcefully change the system's DNS settings to point
+		// to our local DNS resolver (macDnsServer which is usually a local address like 172.19.0.2).
+		// This ensures all DNS queries are routed through our controlled network interface.
+		err = m.setDNSForService(service, []string{macDnsServer})
+		if err != nil {
+			m.logger.warn.Printf("Error setting DNS for service %s: %v\n", service, err)
+		} else {
+			m.logger.info.Printf("Set DNS for %s to %s\n", service, macDnsServer)
+		}
+	}
+	return nil
+}
+
+// restoreOriginalDNS restores the original DNS settings for all network services on macOS
+func (m *MacDNSManager) restoreOriginalDNS() error {
+	for service, dns := range m.originalDNS {
+
+		// Explanation:
+		// When the program or the VPN/proxy is stopped, it's essential to restore the system's
+		// DNS settings back to what they were before. This is done to prevent any lingering
+		// issues or unexpected behavior with the network after the program is shut down.
+		// We iterate through the stored original DNS settings and set them back for each
+		// network service. If a service had no dns, then we set it to "empty" which means remove all DNS settings for it
+		err := m.setDNSForService(service, dns)
+		if err != nil {
+			m.logger.warn.Printf("Error restoring DNS for service %s: %v\n", service, err)
+		} else {
+			m.logger.info.Printf("Restored DNS for %s to %v\n", service, dns)
+		}
+	}
+	return nil
+}
+
 // startSingBox starts the Sing-Box process
 func (s *Server) startSingBox() error {
 	s.mu.Lock()
@@ -284,6 +450,12 @@ func (s *Server) startSingBox() error {
 		return status.Errorf(codes.Internal, "failed to start sing-box: %v", err)
 	}
 
+	if runtime.GOOS == "darwin" {
+		if err := s.macDNS.applyCustomDNS(); err != nil {
+			return status.Errorf(codes.Internal, "failed to apply custom dns settings %v", err)
+		}
+	}
+
 	s.instance = instance
 	s.broadcastStatus("started")
 	s.logger.info.Println("Sing-box started")
@@ -301,6 +473,12 @@ func (s *Server) stopSingBox() error {
 
 	if err := s.instance.Close(); err != nil {
 		return status.Errorf(codes.Internal, "failed to stop sing-box: %v", err)
+	}
+
+	if runtime.GOOS == "darwin" {
+		if err := s.macDNS.restoreOriginalDNS(); err != nil {
+			return status.Errorf(codes.Internal, "failed to restore original dns settings %v", err)
+		}
 	}
 
 	s.instance = nil
