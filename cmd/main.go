@@ -36,6 +36,7 @@ import (
 	pb "oblivion-helper/gRPC"
 
 	box "github.com/sagernet/sing-box"
+	include "github.com/sagernet/sing-box/include"
 	option "github.com/sagernet/sing-box/option"
 
 	"atomicgo.dev/isadmin"
@@ -148,7 +149,7 @@ func (s *Server) loadSingBoxConfig() (*option.Options, error) {
 	}
 
 	var options option.Options
-	if err := json.Unmarshal(content, &options); err != nil {
+	if err := options.UnmarshalJSONContext(include.Context(context.Background()), content); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to parse sing-box config: %v", err)
 	}
 
@@ -440,7 +441,7 @@ func (s *Server) startSingBox() error {
 
 	instance, err := box.New(box.Options{
 		Options: *options,
-		Context: context.Background(),
+		Context: include.Context(context.Background()),
 	})
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create sing-box instance: %v", err)
